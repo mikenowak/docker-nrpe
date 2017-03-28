@@ -1,0 +1,187 @@
+#!/usr/bin/perl
+
+#  Copyright (C) 2003-2017 Opsview Limited. All rights reserved
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+use Getopt::Std;
+use IO::Socket;
+
+$script         = "check_memory";
+$script_version = "1.0 linux";
+
+$total_memory    = 0;
+$inactive_memory = 0;
+$free_memory     = 0;
+$buffer_memory   = 0;
+$cache_memory    = 0;
+$slab_memory     = 0;
+$used_swap       = 0;
+$free_swap       = 0;
+$total_swap      = 0;
+
+$warning  = 99;
+$critical = 100;
+
+# Do we have enough information?
+if ( !@ARGV ) {
+    print "Too few arguments\n";
+    usage();
+}
+
+getopts( "hw:c:" );
+if ($opt_h) {
+    usage();
+}
+if ($opt_w) {
+    $warning = $opt_w;
+}
+if ($opt_c) {
+    $critical = $opt_c;
+}
+
+if ( -e "/proc/meminfo" ) {
+    open INFILE, "</proc/meminfo" or die "Can't open /proc/meminfo $1";
+}
+
+my $counter = 0;
+foreach $line (<INFILE>) {
+    if ( $line =~ /MemTotal:/ ) {
+        $line =~ s/MemTotal://g;
+        $line =~ s/kB//g;
+        $line =~ s/ //g;
+        $line =~ s/\n//g;
+        $line         = $line / 1024;
+        $total_memory = $line;
+    }
+    elsif ( $line =~ /Inactive:/ ) {
+        $line =~ s/Inactive://g;
+        $line =~ s/kB//g;
+        $line =~ s/ //g;
+        $line =~ s/\n//g;
+        $line            = $line / 1024;
+        $inactive_memory = $line;
+    }
+    elsif ( $line =~ /MemFree:/ ) {
+        $line =~ s/MemFree://g;
+        $line =~ s/kB//g;
+        $line =~ s/ //g;
+        $line =~ s/\n//g;
+        $line        = $line / 1024;
+        $free_memory = $line;
+    }
+    elsif ( $line =~ /Buffers:/ ) {
+        $line =~ s/Buffers://g;
+        $line =~ s/kB//g;
+        $line =~ s/ //g;
+        $line =~ s/\n//g;
+        $line          = $line / 1024;
+        $buffer_memory = $line;
+    }
+    elsif ( $line =~ /SReclaimable:/ ) {
+        $line =~ s/SReclaimable://g;
+        $line =~ s/kB//g;
+        $line =~ s/ //g;
+        $line =~ s/\n//g;
+        $line        = $line / 1024;
+        $slab_memory = $line;
+    }
+    elsif ( $line =~ /Cached:/ ) {
+        if ( $line =~ /SwapCached:/ ) {
+        }
+        else {
+            $line =~ s/Cached://g;
+            $line =~ s/kB//g;
+            $line =~ s/ //g;
+            $line =~ s/\n//g;
+            $line         = $line / 1024;
+            $cache_memory = $line;
+        }
+    }
+    elsif ( $line =~ /SwapFree:/ ) {
+        $line =~ s/SwapFree://g;
+        $line =~ s/kB//g;
+        $line =~ s/ //g;
+        $line =~ s/\n//g;
+        $line      = $line / 1024;
+        $free_swap = $line;
+    }
+    elsif ( $line =~ /SwapTotal:/ ) {
+        $line =~ s/SwapTotal://g;
+        $line =~ s/kB//g;
+        $line =~ s/ //g;
+        $line =~ s/\n//g;
+        $line       = $line / 1024;
+        $total_swap = $line;
+    }
+}
+
+$real_used = (
+    $total_memory
+      - ( $cache_memory + $buffer_memory + $free_memory + $slab_memory )
+);
+$real_used_pc = (
+    100 - (
+          ( 100 / $total_memory )
+        * ( $cache_memory + $buffer_memory + $free_memory + $slab_memory )
+    )
+);
+
+# Some people have no swap.
+if ( $total_swap > 0 ) {
+    $swap_used = ( $total_swap - $free_swap );
+    $swap_used_pc = ( 100 - ( ( 100 / $total_swap ) * $free_swap ) );
+}
+else {
+    $swap_used    = 0;
+    $swap_used_pc = 0;
+}
+
+printf
+  "Usage: real %.0f%% (%.0f/%.0f MB), buffer: %.0f MB, cache: %.0f MB, swap: %.0f%% (%.0f/%.0f MB)|utilisation=%.0f\n",
+  $real_used_pc, $real_used, $total_memory, $buffer_memory, $cache_memory,
+  $swap_used_pc, $swap_used, $total_swap, $real_used_pc;
+
+if ( $swap_used_pc > $critical ) {
+    exit 2;
+}
+elsif ( $swap_used_pc > $warning ) {
+    exit 1;
+}
+if ( $real_used_pc > $critical ) {
+    exit 2;
+}
+elsif ( $real_used_pc > $warning ) {
+    exit 1;
+}
+exit 0;
+
+sub usage {
+    print << "USAGE";
+
+$script v$script_version
+
+Returns memory utilisation.
+
+Usage: $script -w <warning threshold> -c <critical threshold>
+Options: -w             Warning threshold (integer)
+         -c             Critical threshold (integer)
+
+                 }
+
+USAGE
+    exit 1;
+}
+

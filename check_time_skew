@@ -1,0 +1,89 @@
+#!/bin/sh
+
+# Check for clock skew on hosts not running ntpd
+
+# v1.0 (C) 2008 Stuart Teasdale <Stuart.Teasdale@opsview.com>
+
+program=/usr/sbin/ntpdate
+program_opts="-q pool.ntp.org"
+
+warntime=1
+crittime=2
+
+# helper functions
+. /usr/lib/nagios/plugins/utils.sh
+
+usage()
+{
+  cat <<EOF
+    Usage: `basename $0` [-w <seconds>] [-c <seconds>] [-n <ntpserver>]
+
+    Check the time of the machine compared to an ntp server (pool.ntp.org
+    by default) and report a warn or error if it is outside of specified
+    boundaries
+EOF
+  exit 1
+}
+
+main()
+{
+  parse_arguments "$@"
+  timecheck
+}
+
+# convert exit code to Nagios output
+exitcode_to_state()
+{
+  if [ "$#" != 1 ]; then
+    echo "Warning - exitcode_to_state called incorrectly ($@)"
+    return 1
+  fi
+  local exitcode="$1"
+  case "$exitcode" in
+    $STATE_OK) echo "OK";;
+    $STATE_WARNING) echo "WARNING";;
+    $STATE_CRITICAL) echo "CRITICAL";;
+    $STATE_UNKNOWN) echo "UNKNOWN";;
+    $STATE_DEPENDENT) echo "DEPENDENT";;
+    *) echo "exitcode_to_state called with bad exitcode \"$exitcode\"" >&2;
+       echo "UNKNOWN";;
+  esac
+}
+
+timecheck()
+{
+  rc=$STATE_OK
+  msg=""
+  skew=`$program $program_opts 2>/dev/null | grep ntpdate |awk '{ print $10}'`
+  if [ -z "$skew" ]; then
+    msg="Problem executing $program";
+    rc=$STATE_UNKNOWN
+  else
+    msg="$msg clock skew of ${skew}s - Machine time is `date`"
+
+    if [ `echo "$skew < 0"|bc` = 1 ]; then skew=`echo "0 - $skew"|bc` ; fi
+    if [ `echo "$skew > $warntime"|bc` = 1 ]; then
+      rc=$STATE_WARNING
+    fi
+    if [ `echo "$skew > $crittime"|bc` = 1 ]; then
+      rc=$STATE_CRITICAL
+    fi
+  fi
+  echo "TIME `exitcode_to_state $rc` - $msg"
+  return $rc
+
+}
+
+parse_arguments()
+{
+  while getopts "hw:c:n:" opt; do
+    case "$opt" in
+      h) usage;;
+      w) warntime="$OPTARG";;
+      c) crittime="$OPTARG";;
+      n) program_opts="-q $OPTARG";;
+    esac
+  done
+}
+
+main "$@"
