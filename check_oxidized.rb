@@ -15,7 +15,7 @@ hostname = ""
 OptionParser.new do |op|
   op.parse!
   hostname = ARGV.pop
-  raise "Need to specify a hostname" unless hostname
+  hostname = "localhost" unless hostname
 end
 
 json = JSON.load(open("http://#{hostname}:8888/nodes.json"))
