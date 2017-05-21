@@ -5,20 +5,21 @@
 require 'open-uri'
 require 'json'
 require 'optparse'
+require 'openssl'
 
 critical = false
 pending = false
 critical_nodes = []
 pending_nodes = []
-hostname = ""
+url = ""
 
 OptionParser.new do |op|
   op.parse!
-  hostname = ARGV.pop
-  hostname = "localhost" unless hostname
+  url = ARGV.pop
+  url = "http://localhost:8888" unless url 
 end
 
-json = JSON.load(open("http://#{hostname}:8888/nodes.json"))
+json = JSON.load(open("#{url}/nodes.json", {ssl_verify_mode: OpenSSL::SSL::VERIFY_NONE}))
 json.each do |node|
   if not node['last'].nil?
     if node['last']['status'] != 'success'
