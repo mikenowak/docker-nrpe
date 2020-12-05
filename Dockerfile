@@ -1,4 +1,4 @@
-FROM alpine:edge
+FROM alpine:latest
 
 RUN apk add --no-cache perl ruby ruby-json nrpe nagios-plugins-procs nagios-plugins-time nagios-plugins-load nagios-plugins-swap nagios-plugins-disk python3 sudo \
    && echo 'nagios ALL=(ALL) NOPASSWD: /usr/lib/nagios/plugins/*' >> /etc/sudoers \
