@@ -2,7 +2,7 @@ FROM ubuntu:latest
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get update -y \
+RUN apt-get update && apt-get upgrade -y \
    && apt-get install -y nagios-nrpe-server nagios-plugins libmonitoring-plugin-perl sudo python3 ruby ruby-json \
    && rm -rf /var/lib/apt/lists/* \
    && echo 'nagios ALL=(ALL) NOPASSWD: /usr/lib/nagios/plugins/*' >> /etc/sudoers \
