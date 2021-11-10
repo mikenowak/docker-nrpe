@@ -1,0 +1,106 @@
+#!/usr/bin/perl -w
+#
+# SYNTAX:
+# 	check_file_count
+#
+# DESCRIPTION:
+# 	Checks the number of files within a directory are within limits
+#
+# AUTHORS:
+#    Copyright (C) 2003-2021 Opsview Limited. All rights reserved
+#
+#    This file is part of Opsview
+#
+
+use strict;
+use warnings;
+
+use lib "/opt/opsview/agent/perl/lib";
+use lib "/opt/opsview/perl/lib/perl5";
+use lib "/opt/opsview/agent/plugins";
+use lib "/usr/lib/nagios/plugins";
+
+use Monitoring::Plugin;
+
+my $VERSION = '0.01';
+
+my $np = Monitoring::Plugin->new(
+    usage     => qq{Usage: %s [-w <n>] [-c <n>] <path to directory>},
+    shortname => 'COUNT',
+    version   => $VERSION,
+    blurb =>
+      q{Check the number of files and directories within a parent directory are
+within limits.},
+);
+
+$np->add_arg(
+    spec => 'debug=i',
+    help => qq{--debug=<n>
+   Enable debug output, use 0 to 5 (default: 0)},
+    default => 0,
+);
+
+$np->add_arg(
+    spec => 'warning|w=s',
+    help => qq{-w, --warning=INTEGER
+   Warning limit to alert over (default: 20)},
+    default => 20,
+);
+
+$np->add_arg(
+    spec => 'critical|c=s',
+    help => qq{-c, --critical=INTEGER
+   Critical limit to alert over (default: 50) },
+    default => 50,
+);
+
+$np->getopts;
+
+my $directory = shift;
+
+if ( !$directory ) {
+    $np->nagios_die( 'Directory path not provided' );
+}
+
+if ( !-d $directory ) {
+    $np->nagios_die( 'Path provided does not exist or is not a directory' );
+}
+
+debug( 1, 'Setting debug level to ', $np->opts->debug );
+
+debug( 1, 'Setting timeout to ', $np->opts->timeout );
+alarm( $np->opts->timeout );
+
+debug( 1, 'Opening directory ', $directory );
+opendir( my $dh, $directory )
+  || $np->nagios_die( "Unable to read $directory: $!" );
+
+debug( 1, 'Reading directory contents' );
+my @dir_list = readdir($dh);
+
+my $file_count = scalar(@dir_list) - 2; # always take '.' and '..' off count
+debug( 1, 'Found ', $file_count, ' items within ', $directory );
+
+debug( 1, 'Closing directory ', $directory );
+closedir($dh) || $np->nagios_die( "Unable to close $directory: $!" );
+
+debug( 1, 'Setting up perfdata' );
+$np->add_perfdata(
+    label    => 'count',
+    value    => $file_count,
+    critical => $np->opts->critical,
+    warning  => $np->opts->warning,
+);
+
+debug( 1, 'Finalising details' );
+$np->nagios_exit(
+    return_code => $np->check_threshold($file_count),
+    message     => "Found $file_count items within $directory",
+);
+
+sub debug {
+    my ( $level, @text ) = @_;
+    if ( $level <= $np->opts->debug ) {
+        warn @text, $/;
+    }
+}

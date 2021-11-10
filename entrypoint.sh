@@ -1,11 +1,11 @@
 #!/bin/sh
 
-sed -i "s/allowed_hosts=127.0.0.1/allowed_hosts=127.0.0.1, ${NAGIOS_SERVER}/g" /etc/nrpe.cfg
+sed -i "s/^allowed_hosts=127.0.0.1$/allowed_hosts=127.0.0.1, ${NAGIOS_SERVER}/g" /etc/nagios/nrpe.cfg
 
-/usr/bin/nrpe -c /etc/nrpe.cfg -d
+/usr/sbin/nrpe -c /etc/nagios/nrpe.cfg -d
 
 # Wait for NRPE Daemon to exit
-PID=$(ps -ef | grep -v grep | grep  "/usr/bin/nrpe" | awk '{print $1}')
+PID=$(ps -ef | grep -v grep | grep  "/usr/sbin/nrpe" | awk '{print $2}')
 if [ ! "$PID" ]; then
   echo "Error: Unable to start nrpe daemon..."
   # exit 1
