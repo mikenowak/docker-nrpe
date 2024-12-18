@@ -10,6 +10,7 @@
 import argparse
 import re
 import sys
+import fnmatch
 
 def globs_to_re(patterns):
     """Converts shell-like glob patterns to regular expressions."""
@@ -36,23 +37,34 @@ def check_read_only_mounts(mtab, includes, excludes, excluded_types):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mtab", default="/proc/mounts")
+    parser.add_argument("-p", "--path", action="append", default=[], help="Glob pattern of path or partition to check (may be repeated)")
     parser.add_argument("--include", default="", help="Include mounts matching this pattern")
     parser.add_argument("--exclude", default="", help="Exclude mounts matching this pattern")
     parser.add_argument("--exclude-type", default="", help="Exclude FS types matching this pattern")
     args = parser.parse_args()
 
-    includes_re = globs_to_re(args.include)
-    excludes_re = globs_to_re(args.exclude)
-    excluded_types_re = globs_to_re(args.exclude_type)
+    # Modify includes input to be in the format expected by globs_to_re
+    if args.path:
+        # Adjusting for case where both --path and --include are used
+        include_patterns = args.path if not args.include else args.path + [args.include]
+    else:
+        include_patterns = [args.include] if args.include else []
+
+    includes_re = globs_to_re(include_patterns)
+    excludes_re = globs_to_re([args.exclude]) if args.exclude else "a^"
+    excluded_types_re = globs_to_re([args.exclude_type]) if args.exclude_type else "a^"
 
     ro_mounts = check_read_only_mounts(args.mtab, includes_re, excludes_re, excluded_types_re)
 
     if ro_mounts:
-        print(f"CRITICAL: Read-only file systems detected: {' '.join([f'{mnt[1]} ({mnt[2]})' for mnt in ro_mounts])}")
+        print("CRITICAL: Read-Only Mount Points Detected:")
+        for device, mount_point, fs_type in ro_mounts:
+            print(f"{device} on {mount_point} type {fs_type} (ro)")
         sys.exit(2)  # Critical
     else:
         print("OK: No read-only file systems detected.")
         sys.exit(0)  # OK
+
 
 if __name__ == "__main__":
     main()
