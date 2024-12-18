@@ -12,7 +12,6 @@ if [ -n "${NAGIOS_SERVER}" ]; then
     fi
 fi
 
-tail -f /var/log/nrpe.log &
 
-# Start NRPE in foreground mode
-exec /usr/bin/nrpe -c /etc/nrpe.cfg -f
+/usr/bin/nrpe -c /etc/nrpe.cfg -f &
+exec tail -f /var/log/nrpe.log
