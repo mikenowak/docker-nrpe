@@ -14,4 +14,5 @@ fi
 
 
 /usr/bin/nrpe -c /etc/nrpe.cfg -f &
+sleep 5
 exec tail -f /var/log/nrpe.log
