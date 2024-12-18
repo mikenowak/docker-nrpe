@@ -1,7 +1,8 @@
 FROM alpine:3.20
 
 RUN apk add --no-cache \
-    nagios-plugins \
+    monitoring-plugins \
+    nagios-plugins-all \
     nrpe \
     perl \
     sudo \
@@ -9,7 +10,6 @@ RUN apk add --no-cache \
     ruby \
     ruby-json \
     bash \
-    && adduser -D -u 5666 nagios \
     && echo 'nagios ALL=(ALL) NOPASSWD: /usr/lib/monitoring-plugins/*' >> /etc/sudoers \
     && echo 'Defaults: nagios !requiretty' >> /etc/sudoers
 

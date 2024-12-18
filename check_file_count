@@ -19,6 +19,7 @@ use lib "/opt/opsview/agent/perl/lib";
 use lib "/opt/opsview/perl/lib/perl5";
 use lib "/opt/opsview/agent/plugins";
 use lib "/usr/lib/nagios/plugins";
+use lib "/usr/lib/monitoring-plugins";
 
 use Monitoring::Plugin;
 

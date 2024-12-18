@@ -1,139 +1,58 @@
-#!/usr/bin/perl -w
-
-# check_ro_mounts.pl Copyright (c) 2008 Valentin Vidic <vvidic@carnet.hr>
+#!/usr/bin/env python3
 #
 # Checks the mount table for read-only mounts - these are usually a sign of
 # trouble (broken filesystem etc.)
 #
+# This script is based on the following script originally written in perl
+# * check_ro_mounts.pl by Valentin Vidic <vvidic@carnet.hr>
+# and is meant to work as a drop-in replacement.
 #
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
-# of the License, or (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty
-# of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# you should have received a copy of the GNU General Public License
-# along with this program (or with Nagios);  if not, write to the
-# Free Software Foundation, Inc., 59 Temple Place - Suite 330,
-# Boston, MA 02111-1307, USA
+import argparse
+import re
+import sys
 
-use strict;
-use Getopt::Long;
-use lib qw( /opt/opsview/perl/lib/perl5 /opt/opsview/monitoringscripts/plugins /usr/lib/nagios/plugins );
-use Monitoring::Plugin;
-use utils qw (%ERRORS &support);
+def globs_to_re(patterns):
+    """Converts shell-like glob patterns to regular expressions."""
+    return re.compile("|".join([fnmatch.translate(p) for p in patterns]) if patterns else "a^")
 
-my $name = 'RO_MOUNTS';
-my $mtab = '/proc/mounts';
-my @includes = ();
-my @excludes = ();
-my @excluded_types = ();
-my @ro_mounts = ();
-my $want_help = 0;
+def check_read_only_mounts(mtab, includes, excludes, excluded_types):
+    ro_mounts = []
+    try:
+        with open(mtab, 'r') as mt:
+            for line in mt:
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    device, mount_point, fs_type, options = parts[:4]
+                    if 'ro' in options.split(',') and (not includes or re.search(includes, mount_point)) \
+                      and not re.search(excludes, mount_point) \
+                      and not re.search(excluded_types, fs_type):
+                        ro_mounts.append((device, mount_point, fs_type))
+    except IOError as exc:
+        print(f"UNKNOWN: Cannot open {mtab} - {str(exc)}")
+        sys.exit(3) # Unknown
 
-Getopt::Long::Configure(qw(no_ignore_case));
-my $res = GetOptions(
-    "help|h" => \$want_help,
-    "mtab|m=s" => \$mtab,
-    "path|p=s" => \@includes,
-    "partition=s" => \@includes,
-    "exclude|x=s" => \@excludes,
-    "exclude-type|X=s" => \@excluded_types,
-);
+    return ro_mounts
 
-if ($want_help or !$res) {
-    print_help();
-    exit $ERRORS{$res ? 'OK' : 'UNKNOWN'};
-}
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mtab", default="/proc/mounts")
+    parser.add_argument("--include", default="", help="Include mounts matching this pattern")
+    parser.add_argument("--exclude", default="", help="Exclude mounts matching this pattern")
+    parser.add_argument("--exclude-type", default="", help="Exclude FS types matching this pattern")
+    args = parser.parse_args()
 
-my $includes_re       = globs2re(@includes);
-my $excludes_re       = globs2re(@excludes);
-my $excluded_types_re = globs2re(@excluded_types);
+    includes_re = globs_to_re(args.include)
+    excludes_re = globs_to_re(args.exclude)
+    excluded_types_re = globs_to_re(args.exclude_type)
 
-open(MTAB, $mtab) or nagios_exit(UNKNOWN => "Can't open $mtab: $!");
-MOUNT: while (<MTAB>) {
-    # parse mtab lines
-    my ($dev, $dir, $fs, $opt) = split;
-    my @opts = split(',', $opt);
+    ro_mounts = check_read_only_mounts(args.mtab, includes_re, excludes_re, excluded_types_re)
 
-    # check includes/excludes
-    if ($includes_re) {
-        next MOUNT unless $dev =~ qr/$includes_re/
-                       or $dir =~ qr/$includes_re/;
-    }
-    if ($excludes_re) {
-        next MOUNT if $dev =~ qr/$excludes_re/
-                   or $dir =~ qr/$excludes_re/;
-    }
-    if ($excluded_types_re) {
-        next MOUNT if $fs =~ qr/$excluded_types_re/;
-    }
+    if ro_mounts:
+        print(f"CRITICAL: Read-only file systems detected: {' '.join([f'{mnt[1]} ({mnt[2]})' for mnt in ro_mounts])}")
+        sys.exit(2)  # Critical
+    else:
+        print("OK: No read-only file systems detected.")
+        sys.exit(0)  # OK
 
-    # check for ro option
-    if (grep /^ro$/, @opts) {
-        push @ro_mounts, $dir;
-    }
-}
-nagios_exit(UNKNOWN => "Read failed on $mtab: $!") if $!;
-close(MTAB) or nagios_exit(UNKNOWN => "Can't close $mtab: $!");
-
-# report findings
-if (@ro_mounts) {
-    nagios_exit(CRITICAL => "Found ro mounts: @ro_mounts");
-} else {
-    nagios_exit(OK => "No ro mounts found");
-}
-
-# convert glob patterns to a RE (undef if no patterns)
-sub globs2re {
-    my(@patterns) = @_;
-
-    @patterns or return undef;
-    foreach (@patterns) {
-        s/ \\(.)       / sprintf('\x%02X', ord($1)) /egx;
-        s/ ([^\\*?\w]) / sprintf('\x%02X', ord($1)) /egx;
-        s/\*/.*/g;
-        s/\?/./g;
-    }
-    return '\A(?:' . join('|', @patterns) . ')\z';
-}
-
-# output the result and exit plugin style
-sub nagios_exit {
-    my ($result, $msg) = @_;
-
-    print "$name $result: $msg\n";
-    exit $ERRORS{$result};
-}
-
-sub print_help {
-    print <<EOH;
-check_ro_mounts 0.1
-Copyright (c) 2008 Valentin Vidic <vvidic\@carnet.hr>
-
-This plugin checks the mount table for read-only mounts.
-
-
-Usage:
-  check_ro_mounts [-m mtab] [-p path] [-x path] [-X type]
-
-Options:
- -h, --help
-    Print detailed help screen
- -m, --mtab=FILE
-    Use this mtab instead (default is /proc/mounts)
- -p, --path=PATH, --partition=PARTITION
-    Glob pattern of path or partition to check (may be repeated)
- -x, --exclude=PATH <STRING>
-    Glob pattern of path or partition to ignore (only works if -p unspecified)
- -X, --exclude-type=TYPE <STRING>
-    Ignore all filesystems of indicated type (may be repeated)
-
-EOH
-
-    support();
-}
+if __name__ == "__main__":
+    main()

@@ -13,4 +13,4 @@ if [ -n "${NAGIOS_SERVER}" ]; then
 fi
 
 # Start NRPE in foreground mode
-exec /usr/sbin/nrpe -c /etc/nrpe.cfg -f
+exec /usr/bin/nrpe -c /etc/nrpe.cfg -f

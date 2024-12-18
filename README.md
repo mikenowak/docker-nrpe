@@ -89,7 +89,7 @@ docker build -t local/nrpe .
 This container includes monitoring scripts from various sources:
 
 - check_oxidized: https://github.com/ytti/oxidized
-- check_cpu_stats.sh, check_file_count, check_ro_mounts, check_time_skew, check_memory: Originally from Opsview (version unknown)
+- check_cpu_stats.sh, check_memory: Originally from Opsview (version unknown)
 - check_docker and check_swarm: https://github.com/timdaman/check_docker
 - check_backup: Custom script by the container author
 
