@@ -578,7 +578,7 @@ def check_health(container):
         else:
             unknown(message)
     else:
-        unknown('{} has no health check data'.format(container))
+        ok('{} has no health check data'.format(container))
 
 
 @multithread_execution()

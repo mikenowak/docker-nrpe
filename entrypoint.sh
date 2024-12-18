@@ -1,17 +1,16 @@
 #!/bin/sh
+set -e
 
-sed -i "s/^allowed_hosts=127.0.0.1$/allowed_hosts=127.0.0.1, ${NAGIOS_SERVER}/g" /etc/nagios/nrpe.cfg
-
-/usr/sbin/nrpe -c /etc/nagios/nrpe.cfg -d
-
-# Wait for NRPE Daemon to exit
-PID=$(ps -ef | grep -v grep | grep  "/usr/sbin/nrpe" | awk '{print $2}')
-if [ ! "$PID" ]; then
-  echo "Error: Unable to start nrpe daemon..."
-  # exit 1
+# Update allowed hosts only if needed
+if [ -n "${NAGIOS_SERVER}" ]; then
+    CURRENT_HOSTS=$(grep "^allowed_hosts" /etc/nrpe.cfg | cut -d= -f2)
+    EXPECTED_HOSTS="127.0.0.1,${NAGIOS_SERVER}"
+    
+    if [ "$CURRENT_HOSTS" != "$EXPECTED_HOSTS" ]; then
+        echo "Updating allowed_hosts configuration..."
+        sed -i "s/^allowed_hosts=.*$/allowed_hosts=${EXPECTED_HOSTS}/g" /etc/nrpe.cfg
+    fi
 fi
-while [ -d /proc/$PID ] && [ -z `grep zombie /proc/$PID/status` ]; do
-    echo "NRPE: $PID (running)..."
-    sleep 60s
-done
-echo "NRPE daemon exited. Quitting.."
+
+# Start NRPE in foreground mode
+exec /usr/sbin/nrpe -c /etc/nrpe.cfg -f

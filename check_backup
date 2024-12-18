@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+#
+# Nagios plugin to monitor backups created by mikenowak/backup Docker container
+# (https://hub.docker.com/r/mikenowak/backup)
+#
+# The script checks for the existence and validity of backup files (both app_*.tar.gz/backup_*.tar.gz
+# and db_*.sql.bz2/backup_*.sql.bz2) in specified directories, verifying their size and age.
+#
+# Default backup location: /backup
+#
+# Usage:
+#   ./check_backup.py [--path /path/to/backups] [--min-size bytes] [--days days_to_check]
+#
+import os
+import sys
+from datetime import datetime, timedelta
+import glob
+from collections import defaultdict
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Check backup files status')
+    parser.add_argument('--path', '-p', 
+                      default='/backup',
+                      help='Path to backup directory (default: /backup)')
+    parser.add_argument('--min-size', '-s',
+                      type=int,
+                      default=1000,
+                      help='Minimum file size in bytes (default: 1000)')
+    parser.add_argument('--days', '-d',
+                      type=int,
+                      default=2,
+                      help='Number of days to check (default: 2)')
+    return parser.parse_args()
+
+def get_backup_dirs(backup_dir="/backup"):
+    """Get only directories that contain backup files."""
+    backup_dirs = set()
+    patterns = ["backup_*.tar.gz", "backup_*.sql.bz2", "app_*.tar.gz", "db_*.sql.bz2"]
+    
+    for subdir in next(os.walk(backup_dir))[1]:
+        dir_path = os.path.join(backup_dir, subdir)
+        # Check if directory contains any backup files
+        for pattern in patterns:
+            if glob.glob(os.path.join(dir_path, pattern)):
+                backup_dirs.add(dir_path)
+                break
+    
+    return backup_dirs
+
+def get_latest_files(directory, pattern, days_to_check=2):
+    """Get the most recent files matching pattern."""
+    files = []
+    for pat in pattern if isinstance(pattern, list) else [pattern]:
+        files.extend(glob.glob(os.path.join(directory, pat)))
+    
+    if not files:
+        return []
+    
+    # Sort files by modification time, most recent first
+    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    
+    # Return files from last N days
+    cutoff_time = datetime.now() - timedelta(days=days_to_check)
+    return [f for f in files if datetime.fromtimestamp(os.path.getmtime(f)) > cutoff_time]
+
+def check_backups(backup_dir="/backup", min_size=1000, days_to_check=2):
+    current_date = datetime.now()
+    results = defaultdict(lambda: {
+        "last_tar": None,
+        "last_sql": None,
+        "status": "OK",
+        "days": 0,
+        "errors": []
+    })
+
+    # Check if backup directory exists
+    if not os.path.exists(backup_dir):
+        print(f"CRITICAL: Backup directory {backup_dir} does not exist")
+        sys.exit(2)
+
+    # Get only directories containing backup files
+    backup_dirs = get_backup_dirs(backup_dir)
+
+    # Process each backup directory
+    for dir_path in backup_dirs:
+        dir_name = os.path.basename(dir_path).upper()
+
+        # Check latest tar.gz files
+        tar_patterns = ["backup_*.tar.gz", "app_*.tar.gz"]
+        for file_path in get_latest_files(dir_path, tar_patterns, days_to_check):
+            try:
+                if os.path.getsize(file_path) < min_size:
+                    results[dir_name]["errors"].append(
+                        f"File too small: {os.path.basename(file_path)}"
+                    )
+                    continue
+
+                date_str = os.path.basename(file_path).split('_')[1][:8]
+                file_date = datetime.strptime(date_str, "%Y%m%d")
+                if results[dir_name]["last_tar"] is None or file_date > results[dir_name]["last_tar"]:
+                    results[dir_name]["last_tar"] = file_date
+
+            except Exception as e:
+                results[dir_name]["errors"].append(
+                    f"Error processing {os.path.basename(file_path)}: {str(e)}"
+                )
+
+        # Check latest sql.bz2 files
+        sql_patterns = ["backup_*.sql.bz2", "db_*.sql.bz2"]
+        for file_path in get_latest_files(dir_path, sql_patterns, days_to_check):
+            try:
+                if os.path.getsize(file_path) < 50:
+                    results[dir_name]["errors"].append(
+                        f"File too small: {os.path.basename(file_path)}"
+                    )
+                    continue
+
+                date_str = os.path.basename(file_path).split('_')[1][:8]
+                file_date = datetime.strptime(date_str, "%Y%m%d")
+                if results[dir_name]["last_sql"] is None or file_date > results[dir_name]["last_sql"]:
+                    results[dir_name]["last_sql"] = file_date
+
+            except Exception as e:
+                results[dir_name]["errors"].append(
+                    f"Error processing {os.path.basename(file_path)}: {str(e)}"
+                )
+
+        # Analyze results for this directory
+        if results[dir_name]["errors"]:
+            results[dir_name]["status"] = "CRITICAL"
+            continue
+
+        last_tar = results[dir_name]["last_tar"]
+        last_sql = results[dir_name]["last_sql"]
+
+        if not last_tar or not last_sql:
+            results[dir_name]["status"] = "CRITICAL"
+            results[dir_name]["days"] = 999
+            continue
+
+        last_backup = min(last_tar, last_sql)
+        days_old = (current_date - last_backup).days
+        results[dir_name]["days"] = days_old
+
+        if days_old >= 4:
+            results[dir_name]["status"] = "CRITICAL"
+        elif days_old >= 2:
+            results[dir_name]["status"] = "WARNING"
+
+    return results
+
+def format_output(results):
+    status_priority = {"CRITICAL": 0, "WARNING": 1, "OK": 2}
+    sorted_dirs = sorted(
+        results.items(),
+        key=lambda x: (status_priority[x[1]["status"]], -x[1]["days"])
+    )
+
+    output_parts = []
+    for dir_name, info in sorted_dirs:
+        if info["errors"]:
+            error_text = " - " + "; ".join(info["errors"][:3])  # Show only first 3 errors
+            if len(info["errors"]) > 3:
+                error_text += f" (and {len(info['errors']) - 3} more issues)"
+        else:
+            error_text = ""
+
+        if info["status"] == "OK":
+            output_parts.append(f"OK: {dir_name}{error_text}")
+        else:
+            days_text = f"({info['days']} days ago)" if info.get("days") != 999 else ""
+            output_parts.append(f"{info['status']}: {dir_name} {days_text}{error_text}")
+
+    return " ".join(output_parts)
+
+def main():
+    args = parse_args()
+    results = check_backups(
+        backup_dir=args.path,
+        min_size=args.min_size,
+        days_to_check=args.days
+    )
+    print(format_output(results))
+    sys.exit(2 if any(r["status"] == "CRITICAL" for r in results.values())
+            else 1 if any(r["status"] == "WARNING" for r in results.values())
+            else 0)
+
+if __name__ == "__main__":
+    main()
