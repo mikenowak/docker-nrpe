@@ -21,8 +21,8 @@ import argparse
 def parse_args():
     parser = argparse.ArgumentParser(description='Check backup files status')
     parser.add_argument('--path', '-p', 
-                      default='/backup',
-                      help='Path to backup directory (default: /backup)')
+                      default='/rootfs/home/backup',
+                      help='Path to backup directory (default: /rootfs/home/backup)')
     parser.add_argument('--min-size', '-s',
                       type=int,
                       default=1000,

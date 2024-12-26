@@ -1,0 +1,87 @@
+#!/bin/bash
+
+# check_flatcar_updates.sh
+# Nagios plugin to check for pending updates on Flatcar Container Linux
+# Designed to run from within a privileged container with host access
+# Returns:
+#   0 (OK) - No updates pending
+#   1 (WARNING) - Updates available
+#   2 (CRITICAL) - Unable to check for updates
+#   3 (UNKNOWN) - Script error
+
+# Nagios exit codes
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+# Host filesystem paths
+HOST_ROOT="/rootfs"
+HOST_OS_RELEASE="${HOST_ROOT}/etc/os-release"
+
+# Check if we can access the host's OS release file
+if ! grep -q "^NAME=Flatcar Container Linux" "$HOST_OS_RELEASE" 2>/dev/null; then
+    echo "UNKNOWN - Cannot access Flatcar Container Linux host system"
+    exit $UNKNOWN
+fi
+
+# Function to run update_engine_client on the host
+check_updates() {
+    # Using nsenter to run the command in the host's namespace
+    # This assumes the container has the necessary privileges
+    nsenter --target 1 --mount --pid --net --ipc -- update_engine_client -status 2>/dev/null
+}
+
+# Get update status
+UPDATE_STATUS=$(check_updates)
+if [ $? -ne 0 ]; then
+    echo "CRITICAL - Failed to get update status from host"
+    exit $CRITICAL
+fi
+
+# Check for errors in update status
+if echo "$UPDATE_STATUS" | grep -q "ERROR"; then
+    echo "CRITICAL - Error checking updates: $(echo "$UPDATE_STATUS" | grep "ERROR")"
+    exit $CRITICAL
+fi
+
+# Parse current operation
+CURRENT_OP=$(echo "$UPDATE_STATUS" | grep "CURRENT_OP" | cut -d= -f2 | tr -d ' ')
+
+case "$CURRENT_OP" in
+    "UPDATE_STATUS_IDLE")
+        echo "OK - No updates pending"
+        exit $OK
+        ;;
+    "UPDATE_STATUS_CHECKING_FOR_UPDATE")
+        echo "OK - Checking for updates"
+        exit $OK
+        ;;
+    "UPDATE_STATUS_UPDATE_AVAILABLE")
+        # Get new version information if available
+        NEW_VERSION=$(echo "$UPDATE_STATUS" | grep "NEW_VERSION" | cut -d= -f2 | tr -d ' ')
+        echo "WARNING - Update available${NEW_VERSION:+ to version $NEW_VERSION}"
+        exit $WARNING
+        ;;
+    "UPDATE_STATUS_DOWNLOADING")
+        PROGRESS=$(echo "$UPDATE_STATUS" | grep "PROGRESS" | cut -d= -f2 | tr -d ' ')
+        echo "WARNING - Update downloading (${PROGRESS:-0}% complete)"
+        exit $WARNING
+        ;;
+    "UPDATE_STATUS_FINALIZING")
+        echo "WARNING - Update finalizing"
+        exit $WARNING
+        ;;
+    "UPDATE_STATUS_UPDATED_NEED_REBOOT")
+        echo "WARNING - Update installed, reboot required"
+        exit $WARNING
+        ;;
+    "UPDATE_STATUS_REPORTING_ERROR_EVENT")
+        echo "CRITICAL - Error during update process"
+        exit $CRITICAL
+        ;;
+    *)
+        echo "UNKNOWN - Unexpected update status: $CURRENT_OP"
+        exit $UNKNOWN
+        ;;
+esac
