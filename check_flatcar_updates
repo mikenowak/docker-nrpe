@@ -20,7 +20,7 @@ HOST_ROOT="/rootfs"
 HOST_OS_RELEASE="${HOST_ROOT}/etc/os-release"
 
 # Check if we can access the host's OS release file
-if ! grep -q "^NAME=Flatcar Container Linux" "$HOST_OS_RELEASE" 2>/dev/null; then
+if ! grep -q "^NAME=\"Flatcar Container Linux" "$HOST_OS_RELEASE" 2>/dev/null; then
     echo "UNKNOWN - Cannot access Flatcar Container Linux host system"
     exit $UNKNOWN
 fi
