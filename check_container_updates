@@ -1,0 +1,108 @@
+#!/bin/bash
+
+# Define exit codes for Nagios/NRPE
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+# Configuration
+EXCLUDE_CONTAINERS="nrpe" # Add more containers to exclude, space-separated
+MAX_AGE_WARNING=1  # Days
+MAX_AGE_CRITICAL=2 # Days
+
+# Function to execute Docker commands in host namespace
+docker_cmd() {
+    nsenter -t 1 -m -u -n -i docker "$@"
+}
+
+# Function to check if string is in exclude list
+is_excluded() {
+    local container_name=$1
+    for excluded in $EXCLUDE_CONTAINERS; do
+        if [ "$container_name" == "$excluded" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function to convert Docker timestamp to Unix timestamp
+convert_timestamp() {
+    local docker_time="$1"
+    # Extract date and time, removing timezone and UTC
+    cleaned_time=$(echo "$docker_time" | sed 's/ +0000 UTC$//' | sed 's/ UTC$//')
+    date -d "$cleaned_time" +%s
+}
+
+# Check if nsenter is available
+if ! command -v nsenter >/dev/null 2>&1; then
+    echo "UNKNOWN - nsenter command not found. Please install util-linux package."
+    exit $UNKNOWN
+fi
+
+# Initialize arrays for storing results
+declare -a warnings
+declare -a criticals
+declare -a info
+
+# Get all running containers
+containers=$(docker_cmd ps --format '{{.Names}}\t{{.CreatedAt}}\t{{.ID}}\t{{.Image}}' 2>/dev/null)
+if [ $? -ne 0 ]; then
+    echo "UNKNOWN - Cannot access Docker daemon through nsenter. Check if container has proper privileges."
+    exit $UNKNOWN
+fi
+
+# Current timestamp
+current_time=$(date +%s)
+
+# Check each container
+while IFS=$'\t' read -r name created_at id image; do
+    # Skip if container is in exclude list or if line is empty
+    [ -z "$name" ] && continue
+    is_excluded "$name" && continue
+    
+    # Convert creation time to timestamp and calculate age in days
+    container_time=$(convert_timestamp "$created_at")
+    age_days=$(( (current_time - container_time) / 86400 ))
+    
+    # Check for available updates
+    latest_digest=$(docker_cmd image inspect "$image" --format '{{.RepoDigests}}' 2>/dev/null | head -1)
+    remote_digest=$(docker_cmd pull "$image" >/dev/null 2>&1 && docker_cmd image inspect "$image" --format '{{.RepoDigests}}' 2>/dev/null | head -1)
+    
+    if [ "$latest_digest" != "$remote_digest" ]; then
+        if [ $age_days -gt $MAX_AGE_CRITICAL ]; then
+            criticals+=("$name (Age: ${age_days}d, Update available)")
+        elif [ $age_days -gt $MAX_AGE_WARNING ]; then
+            warnings+=("$name (Age: ${age_days}d, Update available)")
+        else
+            info+=("$name (Update available)")
+        fi
+    fi
+done <<< "$containers"
+
+# Prepare output
+output=""
+exit_code=$OK
+
+if [ ${#criticals[@]} -gt 0 ]; then
+    output="CRITICAL - ${#criticals[@]} containers need urgent updates: ${criticals[*]}"
+    exit_code=$CRITICAL
+elif [ ${#warnings[@]} -gt 0 ]; then
+    output="WARNING - ${#warnings[@]} containers need updates: ${warnings[*]}"
+    exit_code=$WARNING
+else
+    output="OK - All monitored containers are up to date"
+    if [ ${#info[@]} -gt 0 ]; then
+        output="$output | Updates available for: ${info[*]}"
+    fi
+fi
+
+# Add performance data
+total_containers=$(docker_cmd ps -q | wc -l)
+critical_count=${#criticals[@]}
+warning_count=${#warnings[@]}
+output="$output | total=$total_containers;; critical=$critical_count;; warning=$warning_count;;"
+
+echo "$output"
+exit $exit_code
