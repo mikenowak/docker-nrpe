@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Define exit codes for Nagios/NRPE
 OK=0
 WARNING=1
@@ -30,7 +29,6 @@ is_excluded() {
 # Function to convert Docker timestamp to Unix timestamp
 convert_timestamp() {
     local docker_time="$1"
-    # Extract date and time, removing timezone and UTC
     cleaned_time=$(echo "$docker_time" | sed 's/ +0000 UTC$//' | sed 's/ UTC$//')
     date -d "$cleaned_time" +%s
 }
@@ -48,6 +46,7 @@ declare -a info
 
 # Get all running containers
 containers=$(docker_cmd ps --format '{{.Names}}\t{{.CreatedAt}}\t{{.ID}}\t{{.Image}}' 2>/dev/null)
+
 if [ $? -ne 0 ]; then
     echo "UNKNOWN - Cannot access Docker daemon through nsenter. Check if container has proper privileges."
     exit $UNKNOWN
@@ -66,11 +65,41 @@ while IFS=$'\t' read -r name created_at id image; do
     container_time=$(convert_timestamp "$created_at")
     age_days=$(( (current_time - container_time) / 86400 ))
     
-    # Check for available updates
-    latest_digest=$(docker_cmd image inspect "$image" --format '{{.RepoDigests}}' 2>/dev/null | head -1)
-    remote_digest=$(docker_cmd pull "$image" >/dev/null 2>&1 && docker_cmd image inspect "$image" --format '{{.RepoDigests}}' 2>/dev/null | head -1)
+    # Get the digest of the currently running image
+    current_digest=$(docker_cmd inspect "$id" --format '{{.Image}}' 2>/dev/null)
     
-    if [ "$latest_digest" != "$remote_digest" ]; then
+    # Get the digest of the latest image available locally
+    local_digest=$(docker_cmd image inspect "$image" --format '{{.Id}}' 2>/dev/null)
+    
+    # Check remote registry for latest digest (without pulling)
+    remote_digest=$(docker_cmd manifest inspect "$image" 2>/dev/null | grep -o '"digest":"sha256:[a-f0-9]*"' | head -1 | cut -d'"' -f4)
+    
+    # If manifest inspect failed, try an alternative method
+    if [ -z "$remote_digest" ]; then
+        # Use skopeo if available, or fall back to a simple comparison
+        if command -v skopeo >/dev/null 2>&1; then
+            remote_digest=$(skopeo inspect "docker://$image" 2>/dev/null | grep -o '"Digest":"sha256:[a-f0-9]*"' | cut -d'"' -f4)
+        else
+            # Last resort: check if local image is using latest tag and compare with registry
+            remote_digest="unknown"
+        fi
+    fi
+    
+    # Compare: if current container's image differs from local latest, or local differs from remote
+    update_available=0
+    
+    if [ "$current_digest" != "$local_digest" ]; then
+        update_available=1
+    elif [ -n "$remote_digest" ] && [ "$remote_digest" != "unknown" ]; then
+        # Compare local digest with remote (strip sha256: prefix if present)
+        local_short=$(echo "$local_digest" | sed 's/sha256://')
+        remote_short=$(echo "$remote_digest" | sed 's/sha256://')
+        if [ "$local_short" != "$remote_short" ]; then
+            update_available=1
+        fi
+    fi
+    
+    if [ $update_available -eq 1 ]; then
         if [ $age_days -gt $MAX_AGE_CRITICAL ]; then
             criticals+=("$name (Age: ${age_days}d, Update available)")
         elif [ $age_days -gt $MAX_AGE_WARNING ]; then
@@ -102,6 +131,7 @@ fi
 total_containers=$(docker_cmd ps -q | wc -l)
 critical_count=${#criticals[@]}
 warning_count=${#warnings[@]}
+
 output="$output | total=$total_containers;; critical=$critical_count;; warning=$warning_count;;"
 
 echo "$output"
