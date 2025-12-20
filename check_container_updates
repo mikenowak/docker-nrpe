@@ -7,8 +7,7 @@ UNKNOWN=3
 
 # Configuration
 EXCLUDE_CONTAINERS="nrpe" # Add more containers to exclude, space-separated
-MAX_AGE_WARNING=1  # Days
-MAX_AGE_CRITICAL=2 # Days
+MAX_AGE_CRITICAL=7 # Days - 7+ days old is critical
 
 # Function to execute Docker commands in host namespace
 docker_cmd() {
@@ -29,8 +28,16 @@ is_excluded() {
 # Function to convert Docker timestamp to Unix timestamp
 convert_timestamp() {
     local docker_time="$1"
-    cleaned_time=$(echo "$docker_time" | sed 's/ +0000 UTC$//' | sed 's/ UTC$//')
-    date -d "$cleaned_time" +%s
+    # Remove timezone abbreviation (EET, UTC, etc.) but keep offset
+    cleaned_time=$(echo "$docker_time" | sed 's/ [A-Z]\{2,4\}$//')
+    date -d "$cleaned_time" +%s 2>/dev/null || echo "0"
+}
+
+# Function to extract service name from swarm container name
+get_service_name() {
+    local container_name="$1"
+    # Extract service name from swarm format: service_name.replica.id
+    echo "$container_name" | sed 's/\.[0-9]\+\..*$//'
 }
 
 # Check if nsenter is available
@@ -42,7 +49,6 @@ fi
 # Initialize arrays for storing results
 declare -a warnings
 declare -a criticals
-declare -a info
 
 # Get all running containers
 containers=$(docker_cmd ps --format '{{.Names}}\t{{.CreatedAt}}\t{{.ID}}\t{{.Image}}' 2>/dev/null)
@@ -61,6 +67,9 @@ while IFS=$'\t' read -r name created_at id image; do
     [ -z "$name" ] && continue
     is_excluded "$name" && continue
     
+    # Extract service name for swarm containers
+    service_name=$(get_service_name "$name")
+    
     # Convert creation time to timestamp and calculate age in days
     container_time=$(convert_timestamp "$created_at")
     age_days=$(( (current_time - container_time) / 86400 ))
@@ -71,19 +80,9 @@ while IFS=$'\t' read -r name created_at id image; do
     # Get the digest of the latest image available locally
     local_digest=$(docker_cmd image inspect "$image" --format '{{.Id}}' 2>/dev/null)
     
-    # Check remote registry for latest digest (without pulling)
+    # Check remote registry for latest digest using manifest inspect (no download)
+    # This only fetches metadata, not the actual image
     remote_digest=$(docker_cmd manifest inspect "$image" 2>/dev/null | grep -o '"digest":"sha256:[a-f0-9]*"' | head -1 | cut -d'"' -f4)
-    
-    # If manifest inspect failed, try an alternative method
-    if [ -z "$remote_digest" ]; then
-        # Use skopeo if available, or fall back to a simple comparison
-        if command -v skopeo >/dev/null 2>&1; then
-            remote_digest=$(skopeo inspect "docker://$image" 2>/dev/null | grep -o '"Digest":"sha256:[a-f0-9]*"' | cut -d'"' -f4)
-        else
-            # Last resort: check if local image is using latest tag and compare with registry
-            remote_digest="unknown"
-        fi
-    fi
     
     # Compare: if current container's image differs from local latest, or local differs from remote
     update_available=0
@@ -100,12 +99,10 @@ while IFS=$'\t' read -r name created_at id image; do
     fi
     
     if [ $update_available -eq 1 ]; then
-        if [ $age_days -gt $MAX_AGE_CRITICAL ]; then
-            criticals+=("$name (Age: ${age_days}d, Update available)")
-        elif [ $age_days -gt $MAX_AGE_WARNING ]; then
-            warnings+=("$name (Age: ${age_days}d, Update available)")
+        if [ $age_days -ge $MAX_AGE_CRITICAL ]; then
+            criticals+=("$service_name [Age: ${age_days}d]")
         else
-            info+=("$name (Update available)")
+            warnings+=("$service_name [Age: ${age_days}d]")
         fi
     fi
 done <<< "$containers"
@@ -115,16 +112,13 @@ output=""
 exit_code=$OK
 
 if [ ${#criticals[@]} -gt 0 ]; then
-    output="CRITICAL - ${#criticals[@]} containers need urgent updates: ${criticals[*]}"
+    output="CRITICAL - Updates available: ${criticals[*]}"
     exit_code=$CRITICAL
 elif [ ${#warnings[@]} -gt 0 ]; then
-    output="WARNING - ${#warnings[@]} containers need updates: ${warnings[*]}"
+    output="WARNING - Updates available: ${warnings[*]}"
     exit_code=$WARNING
 else
     output="OK - All monitored containers are up to date"
-    if [ ${#info[@]} -gt 0 ]; then
-        output="$output | Updates available for: ${info[*]}"
-    fi
 fi
 
 # Add performance data
@@ -132,7 +126,7 @@ total_containers=$(docker_cmd ps -q | wc -l)
 critical_count=${#criticals[@]}
 warning_count=${#warnings[@]}
 
-output="$output | total=$total_containers;; critical=$critical_count;; warning=$warning_count;;"
+output="$output | total=$total_containers critical=$critical_count warning=$warning_count"
 
 echo "$output"
 exit $exit_code
