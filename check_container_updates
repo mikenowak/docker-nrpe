@@ -25,14 +25,6 @@ is_excluded() {
     return 1
 }
 
-# Function to convert Docker timestamp to Unix timestamp
-convert_timestamp() {
-    local docker_time="$1"
-    # Remove timezone abbreviation (EET, UTC, etc.) but keep offset
-    cleaned_time=$(echo "$docker_time" | sed 's/ [A-Z]\{2,4\}$//')
-    date -d "$cleaned_time" +%s 2>/dev/null || echo "0"
-}
-
 # Function to extract service name from swarm container name
 get_service_name() {
     local container_name="$1"
@@ -49,9 +41,10 @@ fi
 # Initialize arrays for storing results
 declare -a warnings
 declare -a criticals
+declare -a skipped
 
 # Get all running containers
-containers=$(docker_cmd ps --format '{{.Names}}\t{{.CreatedAt}}\t{{.ID}}\t{{.Image}}' 2>/dev/null)
+containers=$(docker_cmd ps --format '{{.Names}}\t{{.ID}}\t{{.Image}}' 2>/dev/null)
 
 if [ $? -ne 0 ]; then
     echo "UNKNOWN - Cannot access Docker daemon through nsenter. Check if container has proper privileges."
@@ -61,8 +54,11 @@ fi
 # Current timestamp
 current_time=$(date +%s)
 
+# Track if we hit rate limits
+rate_limit_hit=0
+
 # Check each container
-while IFS=$'\t' read -r name created_at id image; do
+while IFS=$'\t' read -r name id image; do
     # Skip if container is in exclude list or if line is empty
     [ -z "$name" ] && continue
     is_excluded "$name" && continue
@@ -70,35 +66,71 @@ while IFS=$'\t' read -r name created_at id image; do
     # Extract service name for swarm containers
     service_name=$(get_service_name "$name")
     
-    # Convert creation time to timestamp and calculate age in days
-    container_time=$(convert_timestamp "$created_at")
-    age_days=$(( (current_time - container_time) / 86400 ))
-    
     # Get the digest of the currently running image
-    current_digest=$(docker_cmd inspect "$id" --format '{{.Image}}' 2>/dev/null)
+    current_digest=$(docker_cmd inspect "$id" --format '{{index .Image}}' 2>/dev/null)
     
-    # Get the digest of the latest image available locally
-    local_digest=$(docker_cmd image inspect "$image" --format '{{.Id}}' 2>/dev/null)
-    
-    # Check remote registry for latest digest using manifest inspect (no download)
-    # This only fetches metadata, not the actual image
-    remote_digest=$(docker_cmd manifest inspect "$image" 2>/dev/null | grep -o '"digest":"sha256:[a-f0-9]*"' | head -1 | cut -d'"' -f4)
-    
-    # Compare: if current container's image differs from local latest, or local differs from remote
-    update_available=0
-    
-    if [ "$current_digest" != "$local_digest" ]; then
-        update_available=1
-    elif [ -n "$remote_digest" ] && [ "$remote_digest" != "unknown" ]; then
-        # Compare local digest with remote (strip sha256: prefix if present)
-        local_short=$(echo "$local_digest" | sed 's/sha256://')
-        remote_short=$(echo "$remote_digest" | sed 's/sha256://')
-        if [ "$local_short" != "$remote_short" ]; then
-            update_available=1
-        fi
+    if [ -z "$current_digest" ]; then
+        continue
     fi
     
-    if [ $update_available -eq 1 ]; then
+    # Try to get remote image info without pulling (using manifest inspect)
+    manifest_output=$(docker_cmd manifest inspect "$image" 2>&1)
+    manifest_exit=$?
+    
+    # Check for rate limit errors
+    if echo "$manifest_output" | grep -qi "rate limit\|toomanyrequests"; then
+        rate_limit_hit=1
+        skipped+=("$service_name")
+        continue
+    fi
+    
+    if [ $manifest_exit -ne 0 ]; then
+        # manifest inspect failed for other reasons, skip this container
+        skipped+=("$service_name")
+        continue
+    fi
+    
+    # Try to parse the manifest for digest and created date
+    # For manifest lists (multi-arch images)
+    remote_digest=$(echo "$manifest_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('manifests', [{}])[0].get('digest', '') if 'manifests' in data else data.get('config', {}).get('digest', ''))" 2>/dev/null)
+    
+    # If python parsing failed, try grep method
+    if [ -z "$remote_digest" ]; then
+        remote_digest=$(echo "$manifest_output" | grep -oP '"digest"\s*:\s*"\K[^"]+' | head -1)
+    fi
+    
+    # If still no digest, fall back to comparing with local latest
+    if [ -z "$remote_digest" ]; then
+        remote_digest=$(docker_cmd image inspect "$image" --format '{{.Id}}' 2>/dev/null)
+    fi
+    
+    if [ -z "$remote_digest" ]; then
+        skipped+=("$service_name")
+        continue
+    fi
+    
+    # Normalize digests for comparison (remove sha256: prefix if present)
+    current_short=$(echo "$current_digest" | sed 's/sha256://')
+    remote_short=$(echo "$remote_digest" | sed 's/sha256://')
+    
+    # Compare digests - if different, update is available
+    if [ "$current_short" != "$remote_short" ]; then
+        # Get the build date of the NEW image from the manifest
+        new_image_created=$(echo "$manifest_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('config', {}).get('created', data.get('created', '')))" 2>/dev/null)
+        
+        # If python parsing failed, try grep method
+        if [ -z "$new_image_created" ]; then
+            new_image_created=$(echo "$manifest_output" | grep -oP '"created"\s*:\s*"\K[^"]+' | head -1)
+        fi
+        
+        age_days=0
+        if [ -n "$new_image_created" ]; then
+            new_image_time=$(date -d "$new_image_created" +%s 2>/dev/null || echo "0")
+            if [ "$new_image_time" != "0" ]; then
+                age_days=$(( (current_time - new_image_time) / 86400 ))
+            fi
+        fi
+        
         if [ $age_days -ge $MAX_AGE_CRITICAL ]; then
             criticals+=("$service_name [Age: ${age_days}d]")
         else
@@ -111,7 +143,10 @@ done <<< "$containers"
 output=""
 exit_code=$OK
 
-if [ ${#criticals[@]} -gt 0 ]; then
+if [ $rate_limit_hit -eq 1 ]; then
+    output="WARNING - Docker Hub rate limit reached. Could not check: ${skipped[*]}"
+    exit_code=$WARNING
+elif [ ${#criticals[@]} -gt 0 ]; then
     output="CRITICAL - Updates available: ${criticals[*]}"
     exit_code=$CRITICAL
 elif [ ${#warnings[@]} -gt 0 ]; then
@@ -119,14 +154,18 @@ elif [ ${#warnings[@]} -gt 0 ]; then
     exit_code=$WARNING
 else
     output="OK - All monitored containers are up to date"
+    if [ ${#skipped[@]} -gt 0 ]; then
+        output="$output (Skipped: ${skipped[*]})"
+    fi
 fi
 
 # Add performance data
 total_containers=$(docker_cmd ps -q | wc -l)
 critical_count=${#criticals[@]}
 warning_count=${#warnings[@]}
+skipped_count=${#skipped[@]}
 
-output="$output | total=$total_containers critical=$critical_count warning=$warning_count"
+output="$output | total=$total_containers critical=$critical_count warning=$warning_count skipped=$skipped_count"
 
 echo "$output"
 exit $exit_code
