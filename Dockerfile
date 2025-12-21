@@ -1,4 +1,4 @@
-FROM alpine:3.20
+FROM alpine:3.23
 
 RUN apk add --no-cache \
     monitoring-plugins \
@@ -10,6 +10,7 @@ RUN apk add --no-cache \
     ruby \
     ruby-json \
     bash \
+    skopeo \
     && echo 'nagios ALL=(ALL) NOPASSWD: /usr/lib/monitoring-plugins/*' >> /etc/sudoers \
     && echo 'Defaults: nagios !requiretty' >> /etc/sudoers
 

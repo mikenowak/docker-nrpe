@@ -8,6 +8,16 @@ UNKNOWN=3
 # Configuration
 EXCLUDE_CONTAINERS="nrpe" # Add more containers to exclude, space-separated
 MAX_AGE_CRITICAL=7 # Days - 7+ days old is critical
+MIN_AGE_WARNING=1  # Only warn if update is at least 1 day old
+
+# Debug mode - set to 1 to see detailed output
+DEBUG=${DEBUG:-0}
+
+debug_log() {
+    if [ $DEBUG -eq 1 ]; then
+        echo "[DEBUG] $*" >&2
+    fi
+}
 
 # Function to execute Docker commands in host namespace
 docker_cmd() {
@@ -57,84 +67,178 @@ current_time=$(date +%s)
 # Track if we hit rate limits
 rate_limit_hit=0
 
+# Check if skopeo is available
+use_skopeo=0
+if command -v skopeo >/dev/null 2>&1; then
+    use_skopeo=1
+fi
+
 # Check each container
 while IFS=$'\t' read -r name id image; do
     # Skip if container is in exclude list or if line is empty
     [ -z "$name" ] && continue
     is_excluded "$name" && continue
-    
+
     # Extract service name for swarm containers
     service_name=$(get_service_name "$name")
-    
-    # Get the digest of the currently running image
-    current_digest=$(docker_cmd inspect "$id" --format '{{index .Image}}' 2>/dev/null)
-    
-    if [ -z "$current_digest" ]; then
+    debug_log "Checking container: $service_name ($name)"
+
+    # Get the image ID and RepoDigests of the running container
+    current_image_id=$(docker_cmd inspect "$id" --format '{{.Image}}' 2>/dev/null)
+
+    if [ -z "$current_image_id" ]; then
+        debug_log "  Skipping: Could not get image ID"
         continue
     fi
-    
-    # Try to get remote image info without pulling (using manifest inspect)
-    manifest_output=$(docker_cmd manifest inspect "$image" 2>&1)
-    manifest_exit=$?
-    
-    # Check for rate limit errors
-    if echo "$manifest_output" | grep -qi "rate limit\|toomanyrequests"; then
-        rate_limit_hit=1
+
+    debug_log "  Image ID: $current_image_id"
+
+    # Get RepoDigests from the local image - this is what was pulled from the registry
+    # Extract just the sha256 hash
+    current_repo_digest=$(docker_cmd inspect "$current_image_id" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null | grep -o 'sha256:[a-f0-9]*' | head -1)
+    debug_log "  Current RepoDigest: $current_repo_digest"
+
+    remote_digest=""
+    new_image_created=""
+
+    # ALWAYS use Skopeo if available - it's the most reliable method
+    if [ $use_skopeo -eq 1 ]; then
+        debug_log "  Using Skopeo to check: $image"
+        # Use skopeo to inspect the image - it handles multi-arch correctly
+        skopeo_output=$(skopeo inspect --override-os linux "docker://$image" 2>&1)
+        skopeo_exit=$?
+
+        debug_log "  Skopeo exit code: $skopeo_exit"
+
+        # Check for rate limit errors - be more specific
+        if echo "$skopeo_output" | grep -qi "toomanyrequests"; then
+            debug_log "  RATE LIMIT DETECTED (toomanyrequests)"
+            rate_limit_hit=1
+            skipped+=("$service_name")
+            continue
+        fi
+
+        # Check if it's a 429 status code specifically (not in timestamps!)
+        if echo "$skopeo_output" | grep -qi "status.*429\|http.*429"; then
+            debug_log "  RATE LIMIT DETECTED (429 status)"
+            rate_limit_hit=1
+            skipped+=("$service_name")
+            continue
+        fi
+
+        if [ $skopeo_exit -ne 0 ]; then
+            # Skopeo failed but not due to rate limit
+            # Add more specific error to skipped list
+            error_reason=$(echo "$skopeo_output" | grep -i "error" | head -1 | cut -c1-50)
+            debug_log "  Skopeo error: $error_reason"
+            if [ -n "$error_reason" ]; then
+                skipped+=("$service_name [error]")
+            else
+                skipped+=("$service_name")
+            fi
+            continue
+        fi
+
+        # Skopeo automatically returns the digest for the current platform (amd64)
+        # This is the CORRECT digest to compare!
+        remote_digest=$(echo "$skopeo_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('Digest', ''))" 2>/dev/null)
+        new_image_created=$(echo "$skopeo_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('Created', ''))" 2>/dev/null)
+
+        debug_log "  Remote digest: $remote_digest"
+        debug_log "  Created: $new_image_created"
+    else
+        # WARNING: Without Skopeo, multi-arch image detection is unreliable!
+        # Fallback: Try to pull the platform-specific manifest
+
+        # Get the platform of the running container
+        container_arch=$(docker_cmd inspect "$current_image_id" --format '{{.Architecture}}' 2>/dev/null)
+        container_os=$(docker_cmd inspect "$current_image_id" --format '{{.Os}}' 2>/dev/null)
+
+        # Try to inspect the platform-specific manifest
+        if [ -n "$container_arch" ] && [ -n "$container_os" ]; then
+            manifest_output=$(docker_cmd manifest inspect "$image" 2>&1)
+            manifest_exit=$?
+
+            if echo "$manifest_output" | grep -qi "rate limit\|toomanyrequests"; then
+                rate_limit_hit=1
+                skipped+=("$service_name")
+                continue
+            fi
+
+            if [ $manifest_exit -ne 0 ]; then
+                skipped+=("$service_name")
+                continue
+            fi
+
+            # Try to find the manifest matching our architecture
+            remote_digest=$(echo "$manifest_output" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+manifests = data.get('manifests', [])
+arch = '$container_arch'
+os = '$container_os'
+for m in manifests:
+    platform = m.get('platform', {})
+    if platform.get('architecture') == arch and platform.get('os') == os:
+        print(m.get('digest', ''))
+        break
+" 2>/dev/null)
+
+            # Fallback: if we can't find platform-specific, skip this container
+            if [ -z "$remote_digest" ]; then
+                skipped+=("$service_name [multi-arch]")
+                continue
+            fi
+        else
+            skipped+=("$service_name")
+            continue
+        fi
+    fi
+
+    if [ -z "$remote_digest" ]; then
         skipped+=("$service_name")
         continue
     fi
-    
-    if [ $manifest_exit -ne 0 ]; then
-        # manifest inspect failed for other reasons, skip this container
-        skipped+=("$service_name")
-        continue
-    fi
-    
-    # Try to parse the manifest for digest and created date
-    # For manifest lists (multi-arch images)
-    remote_digest=$(echo "$manifest_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('manifests', [{}])[0].get('digest', '') if 'manifests' in data else data.get('config', {}).get('digest', ''))" 2>/dev/null)
-    
-    # If python parsing failed, try grep method
-    if [ -z "$remote_digest" ]; then
-        remote_digest=$(echo "$manifest_output" | grep -oP '"digest"\s*:\s*"\K[^"]+' | head -1)
-    fi
-    
-    # If still no digest, fall back to comparing with local latest
-    if [ -z "$remote_digest" ]; then
-        remote_digest=$(docker_cmd image inspect "$image" --format '{{.Id}}' 2>/dev/null)
-    fi
-    
-    if [ -z "$remote_digest" ]; then
-        skipped+=("$service_name")
-        continue
-    fi
-    
+
     # Normalize digests for comparison (remove sha256: prefix if present)
-    current_short=$(echo "$current_digest" | sed 's/sha256://')
+    current_short=$(echo "$current_repo_digest" | sed 's/sha256://')
     remote_short=$(echo "$remote_digest" | sed 's/sha256://')
-    
+
+    # If we don't have a RepoDigest for the current image, skip it
+    # (This means the image was built locally or we can't reliably track it)
+    if [ -z "$current_short" ]; then
+        debug_log "  Skipping: No RepoDigest available"
+        skipped+=("$service_name [no-repodigest]")
+        continue
+    fi
+
+    debug_log "  Comparing: current=$current_short vs remote=$remote_short"
+
     # Compare digests - if different, update is available
     if [ "$current_short" != "$remote_short" ]; then
-        # Get the build date of the NEW image from the manifest
-        new_image_created=$(echo "$manifest_output" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('config', {}).get('created', data.get('created', '')))" 2>/dev/null)
-        
-        # If python parsing failed, try grep method
-        if [ -z "$new_image_created" ]; then
-            new_image_created=$(echo "$manifest_output" | grep -oP '"created"\s*:\s*"\K[^"]+' | head -1)
-        fi
-        
-        age_days=0
+        debug_log "  UPDATE AVAILABLE!"
+        age_days=-1  # -1 means unknown age
+
         if [ -n "$new_image_created" ]; then
             new_image_time=$(date -d "$new_image_created" +%s 2>/dev/null || echo "0")
             if [ "$new_image_time" != "0" ]; then
                 age_days=$(( (current_time - new_image_time) / 86400 ))
             fi
         fi
-        
-        if [ $age_days -ge $MAX_AGE_CRITICAL ]; then
-            criticals+=("$service_name [Age: ${age_days}d]")
+
+        # Only report if we have valid age information and it meets threshold
+        if [ $age_days -ge 0 ]; then
+            if [ $age_days -ge $MAX_AGE_CRITICAL ]; then
+                criticals+=("$service_name [Age: ${age_days}d]")
+            elif [ $age_days -ge $MIN_AGE_WARNING ]; then
+                warnings+=("$service_name [Age: ${age_days}d]")
+            fi
+            # If age is 0 days (less than 24 hours), don't report as it's very recent
         else
-            warnings+=("$service_name [Age: ${age_days}d]")
+            # Age unknown - only report if we want to be notified of all updates
+            # Uncomment the next line if you want to be alerted even when age is unknown
+            # warnings+=("$service_name [Age: unknown]")
+            :  # Do nothing - skip updates with unknown age
         fi
     fi
 done <<< "$containers"
@@ -145,6 +249,9 @@ exit_code=$OK
 
 if [ $rate_limit_hit -eq 1 ]; then
     output="WARNING - Docker Hub rate limit reached. Could not check: ${skipped[*]}"
+    if [ $DEBUG -eq 1 ]; then
+        output="$output (Run with DEBUG=1 for details)"
+    fi
     exit_code=$WARNING
 elif [ ${#criticals[@]} -gt 0 ]; then
     output="CRITICAL - Updates available: ${criticals[*]}"
