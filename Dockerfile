@@ -8,7 +8,6 @@ RUN apk add --no-cache \
     sudo \
     python3 \
     ruby \
-    ruby-json \
     bash \
     skopeo \
     && echo 'nagios ALL=(ALL) NOPASSWD: /usr/lib/monitoring-plugins/*' >> /etc/sudoers \
